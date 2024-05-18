@@ -28,6 +28,11 @@ pub trait OpCode {
     /// indicate whether submitting the operation to polling is required.
     fn pre_submit(self: Pin<&mut Self>) -> io::Result<Decision>;
 
+    /// Get the operation type when an event is occurred.
+    fn op_type(self: Pin<&mut Self>) -> Option<OpType> {
+        None
+    }
+
     /// Perform the operation after received corresponding
     /// event. If this operation is blocking, the return value should be
     /// [`Poll::Ready`].
@@ -146,10 +151,12 @@ impl FdQueue {
     }
 }
 
-// Represents the filter type of kqueue. `polling` crate doesn't expose such
-// API, and we need to know about it when `cancel` is called.
-enum OpType {
+/// Represents the filter type of kqueue. `polling` crate doesn't expose such
+/// API, and we need to know about it when `cancel` is called.
+pub enum OpType {
+    /// The operation polls an fd.
     Fd(RawFd),
+    /// The operation submits an AIO.
     Aio(NonNull<libc::aiocb>),
 }
 
@@ -159,7 +166,6 @@ pub(crate) struct Driver {
     poll: Arc<Poller>,
     registry: HashMap<RawFd, FdQueue>,
     cancelled: HashSet<usize>,
-    keymap: HashMap<usize, OpType>,
     notifier: Notifier,
     pool: AsyncifyPool,
     pool_completed: Arc<SegQueue<Entry>>,
@@ -192,7 +198,6 @@ impl Driver {
             poll,
             registry: HashMap::new(),
             cancelled: HashSet::new(),
-            keymap: HashMap::new(),
             notifier,
             pool: builder.create_or_get_thread_pool(),
             pool_completed: Arc::new(SegQueue::new()),
@@ -223,10 +228,10 @@ impl Driver {
         Ok(())
     }
 
-    pub fn cancel<T>(&mut self, op: Key<T>) {
-        let user_data = op.user_data();
-        self.cancelled.insert(user_data);
-        if let Some(OpType::Aio(aiocbp)) = self.keymap.get(&user_data) {
+    pub fn cancel<T: crate::sys::OpCode>(&mut self, mut op: Key<T>) {
+        self.cancelled.insert(op.user_data());
+        let op = op.as_op_pin();
+        if let Some(OpType::Aio(aiocbp)) = op.op_type() {
             if let Some(aiocb) = unsafe { aiocbp.as_ptr().as_ref() } {
                 let fd = aiocb.aio_fildes;
                 syscall!(libc::aio_cancel(fd, aiocbp.as_ptr())).ok();
@@ -248,7 +253,6 @@ impl Driver {
                     self.submit(user_data, arg)?;
                 }
                 trace!("register {:?}", arg);
-                self.keymap.insert(user_data, OpType::Fd(arg.fd));
                 Poll::Pending
             }
             Decision::Completed(res) => Poll::Ready(Ok(res)),
@@ -268,7 +272,6 @@ impl Driver {
                     aiocb.aio_sigevent.sigev_value.sival_ptr = user_data as _;
                 }
                 syscall!(submit(aiocbp.as_ptr()))?;
-                self.keymap.insert(user_data, OpType::Aio(aiocbp));
                 Poll::Pending
             }
         }
@@ -311,7 +314,9 @@ impl Driver {
                 continue;
             }
             trace!("receive {} for {:?}", user_data, event);
-            match self.keymap.remove(&user_data) {
+            let mut op = Key::<dyn crate::sys::OpCode>::new_unchecked(user_data);
+            let mut op = op.as_op_pin();
+            match op.as_mut().op_type() {
                 None => {
                     // On epoll, multiple event may be received even if it is registered as
                     // one-shot. It is safe to ignore it.
@@ -326,8 +331,6 @@ impl Driver {
                         if self.cancelled.remove(&user_data) {
                             entries.extend(Some(entry_cancelled(user_data)));
                         } else {
-                            let mut op = Key::<dyn crate::sys::OpCode>::new_unchecked(user_data);
-                            let op = op.as_op_pin();
                             let res = match op.on_event() {
                                 Poll::Pending => {
                                     // The operation should go back to the front.
