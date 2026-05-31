@@ -351,18 +351,28 @@ impl<
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
             match &mut self.op {
-                Some(op) => match std::task::ready!(Pin::new(op).poll_next(cx)) {
-                    Some(Ok(Some(buffer))) => {
-                        if buffer.is_empty() {
-                            break Poll::Ready(None);
-                        } else {
-                            break Poll::Ready(Some(Ok(buffer)));
+                Some(op) => {
+                    let mut op = Pin::new(op);
+                    match std::task::ready!(op.as_mut().poll_next(cx)) {
+                        Some(Ok(Some(buffer))) => {
+                            if buffer.is_empty() {
+                                break Poll::Ready(None);
+                            } else {
+                                break Poll::Ready(Some(Ok(buffer)));
+                            }
                         }
+                        Some(Ok(None)) => {
+                            let res = op.as_mut().poll_next(cx);
+                            assert!(
+                                matches!(res, Poll::Ready(None)),
+                                "Multishot operation should terminate after yielding EOF"
+                            );
+                            break Poll::Ready(None);
+                        }
+                        Some(Err(e)) => break Poll::Ready(Some(Err(e))),
+                        None => self.op = None,
                     }
-                    Some(Ok(None)) => break Poll::Ready(None),
-                    Some(Err(e)) => break Poll::Ready(Some(Err(e))),
-                    None => self.op = None,
-                },
+                }
                 None => match (self.create_op)() {
                     Ok(op) => self.op = Some(op),
                     Err(e) => break Poll::Ready(Some(Err(e))),
